@@ -537,7 +537,7 @@ void PidCtrl::pid_loop() {
             stall_check_time_ = {};
             stall_baseline_temp_ = {};
         } else {
-            float dt = PID_INTERVAL_US;
+            float dt = PID_INTERVAL_US / US_PER_SEC;
             duty_cycle_ = static_cast<uint32_t>(compute_pid(temp_ntc_filtered, dt));
 
             if (!has_fault(FaultReason::TEMP_STUCK)) {
