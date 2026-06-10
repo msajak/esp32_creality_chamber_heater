@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 Chamber Heater Controller</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:16px;max-width:1600px;margin:0 auto}
+h1{color:#0f3460;background:#e0e0e0;padding:12px;border-radius:8px;text-align:center;margin-bottom:16px;font-size:1.3em}
+.card{background:#16213e;border-radius:8px;padding:16px;margin-bottom:12px;border:1px solid #0f3460}
+.card h2{color:#53a8b6;font-size:1em;margin-bottom:10px;border-bottom:1px solid #0f3460;padding-bottom:6px}
+label{display:block;font-size:.85em;color:#a0a0a0;margin-bottom:4px}
+select,input[type=text],input[type=password]{width:100%;padding:8px;border:1px solid #0f3460;border-radius:4px;background:#1a1a2e;color:#e0e0e0;margin-bottom:8px;font-size:.9em}
+select:focus,input:focus{outline:none;border-color:#53a8b6}
+button{padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:.9em;margin-right:6px;margin-top:4px}
+.btn-primary{background:#0f3460;color:#fff}
+.btn-primary:hover{background:#1a4a8a}
+.btn-danger{background:#c0392b;color:#fff}
+.btn-danger:hover{background:#e74c3c}
+.status-row{display:flex;justify-content:space-between;padding:4px 0;font-size:.9em}
+.status-val{color:#53a8b6;font-weight:bold}
+.msg{padding:8px;border-radius:4px;margin-top:8px;font-size:.85em;display:none}
+.msg-ok{background:#1e5631;color:#a8e6cf;display:block}
+.msg-err{background:#5c1a1a;color:#ff8a8a;display:block}
+input[type=file]{margin-bottom:8px}
+.progress{height:4px;background:#0f3460;border-radius:2px;margin-top:4px;overflow:hidden;display:none}
+.progress-bar{height:100%;background:#53a8b6;width:0%;transition:width .3s}
+</style>
+</head>
+<body>
+<h1>ESP32 Chamber Heater Controller</h1>
+
+<div class="card" id="status-card">
+  <h2>Status</h2>
+  <div class="status-row"><span>Temp NTC:</span><span class="status-val" id="st-temp-ntc">--</span></div>
+  <div class="status-row"><span>Temp NTC Filtered:</span><span class="status-val" id="st-temp-filtered">--</span></div>
+  <div class="status-row"><span>Temp Filtered OK:</span><span class="status-val" id="st-temp-filtered-ok">--</span></div>
+  <div class="status-row"><span>Setpoint:</span><span class="status-val" id="st-setpoint">--</span></div>
+  <div class="status-row"><span>TempError:</span><span class="status-val" id="st-temperror">--</span></div>
+  <div class="status-row"><span>Heating:</span><span class="status-val" id="st-heating">--</span></div>
+  <div class="status-row"><span>Duty:</span><span class="status-val" id="st-duty">--</span></div>
+  <div class="status-row"><span>Heater Timeout:</span><span class="status-val" id="st-heatertimeout">--</span></div>
+  <div class="status-row"><span>Heater Time Left:</span><span class="status-val" id="st-heatertimeleft">--</span></div>
+  <div class="status-row"><span>Fan:</span><span class="status-val" id="st-fan">--</span></div>
+  <div class="status-row"><span>Fan1 Edges:</span><span class="status-val" id="st-fan1">--</span></div>
+  <div class="status-row"><span>Fan2 Edges:</span><span class="status-val" id="st-fan2">--</span></div>
+  <div class="status-row"><span>Fault:</span><span class="status-val" id="st-fault">--</span></div>
+</div>
+<div class="card">
+  <h2>Wi-Fi Configuration</h2>
+  <label>SSID:</label>
+  <input type="text" id="wifi-ssid" placeholder="Network name">
+  <label>Password:</label>
+  <input type="password" id="wifi-pass" placeholder="Password">
+  <button class="btn-primary" onclick="setWifi()">Connect</button>
+  <div class="msg" id="wifi-msg"></div>
+</div>
+
+<div class="card">
+  <h2>Firmware Update (OTA)</h2>
+  <label>Select firmware binary (.bin):</label>
+  <input type="file" id="ota-file" accept=".bin">
+  <button class="btn-danger" onclick="uploadOta()">Upload & Update</button>
+  <div class="progress" id="ota-progress"><div class="progress-bar" id="ota-bar"></div></div>
+  <div class="msg" id="ota-msg"></div>
+</div>
+
+<div class="card">
+  <h2>System Logs</h2>
+  <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+    <input type="number" id="max-logs" placeholder="Max entries (0=all)" min="0" value="100" style="max-width: 150px; flex: 1;">
+    <button class="btn-primary" onclick="loadLogs()">Refresh</button>
+    <button class="btn-danger" onclick="clearLogs()">Clear</button>
+  </div>
+  <div id="logs-list" style="background: #0a0a0a; border: 1px solid #0f3460; border-radius: 4px; padding: 8px; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.8em; line-height: 1.4; white-space: pre-wrap; word-break: break-word;">
+    <div style="color: #666;">Loading logs...</div>
+  </div>
+  <div class="msg" id="logs-msg"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function showMsg(id, text, ok) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
+  setTimeout(() => el.className = 'msg', 4000);
+}
+
+async function api(url, opts) {
+  try {
+    const r = await fetch(url, opts);
+    return await r.json();
+  } catch(e) { return {error: e.message}; }
+}
+
+async function loadStatus() {
+  const s = await api('/api/status');
+  if (s.error) return;
+  $('st-temp-ntc').textContent = s.temp_ntc.toFixed(1) + '°C';
+  $('st-temp-filtered').textContent = s.temp_filtered.toFixed(1) + '°C';
+  $('st-temp-filtered-ok').textContent = s.temp_filtered_ok ? 'Y' : 'N';
+  $('st-setpoint').textContent = s.setpoint.toFixed(1) + '°C';
+  $('st-temperror').textContent = s.temp_error.toFixed(1) + '°C';
+  $('st-heating').textContent = s.heating_active ? 'ON' : 'OFF';
+  $('st-duty').textContent = s.duty.toFixed(1) + '%';
+  $('st-heatertimeout').textContent = s.heater_timeout_sec + 's';
+  $('st-heatertimeleft').textContent = s.heater_time_left_sec + 's';
+  $('st-fan').textContent = s.fan_status ? 'ON' : 'OFF';
+  $('st-fan1').textContent = s.edge_count_fan1;
+  $('st-fan2').textContent = s.edge_count_fan2;
+  $('st-fault').textContent = s.fault_reason;
+}
+
+async function setWifi() {
+  const ssid = $('wifi-ssid').value;
+  const pass = $('wifi-pass').value;
+  if (!ssid) { showMsg('wifi-msg', 'Enter SSID', false); return; }
+  const r = await api('/api/wifi/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ssid, pass})});
+  showMsg('wifi-msg', r.ok ? r.msg : 'Error', r.ok);
+}
+
+function uploadOta() {
+  const file = $('ota-file').files[0];
+  if (!file) { showMsg('ota-msg', 'Select a firmware file', false); return; }
+  if (!confirm('Upload firmware and reboot? This cannot be undone.')) return;
+
+  const xhr = new XMLHttpRequest();
+  const prog = $('ota-progress');
+  const bar = $('ota-bar');
+  prog.style.display = 'block';
+
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) bar.style.width = Math.round(e.loaded/e.total*100) + '%';
+  };
+  xhr.onload = () => {
+    prog.style.display = 'none';
+    try {
+      const r = JSON.parse(xhr.responseText);
+      showMsg('ota-msg', r.ok ? r.msg : 'Error', r.ok);
+    } catch(e) {
+      showMsg('ota-msg', 'Upload complete, rebooting...', true);
+    }
+  };
+  xhr.onerror = () => {
+    prog.style.display = 'none';
+    showMsg('ota-msg', 'Upload failed', false);
+  };
+
+  xhr.open('POST', '/api/ota/update');
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.send(file);
+}
+
+// Auto-refresh status every 5 seconds
+loadStatus();
+setInterval(loadStatus, 5000);
+
+async function loadLogs() {
+  const maxLogs = parseInt($('max-logs').value) || 0;
+  const url = '/api/logs' + (maxLogs > 0 ? '?max=' + maxLogs : '');
+  try {
+    const response = await fetch(url);
+    const logs = await response.json();
+    const logsList = $('logs-list');
+
+    if (Array.isArray(logs) && logs.length > 0) {
+      const logsText = logs.map(log => {
+        var txt = log.replace(/[\r\n]+/g, '').replace(/[\u001b\x1b]\[[0-9;]*m/g, '');
+        return txt.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }).join('\n');
+      logsList.innerHTML = '<span style="color: #0f0;">' + logsText + '</span>';
+    } else {
+      logsList.innerHTML = '<div style="color: #666;">No logs</div>';
+    }
+  } catch(e) {
+    $('logs-list').innerHTML = '<div style="color: #f00;">Error loading logs: ' + e.message + '</div>';
+  }
+}
+
+async function clearLogs() {
+  if (!confirm('Clear all logs?')) return;
+  try {
+    const r = await fetch('/api/logs/clear', {method: 'POST'});
+    const data = await r.json();
+    showMsg('logs-msg', data.msg || 'Logs cleared', data.ok !== false);
+    loadLogs();
+  } catch(e) {
+    showMsg('logs-msg', 'Error: ' + e.message, false);
+  }
+}
+
+// Load logs on page load and auto-refresh every 2 seconds
+loadLogs();
+setInterval(loadLogs, 2000);
+</script>
+</body>
+</html>
