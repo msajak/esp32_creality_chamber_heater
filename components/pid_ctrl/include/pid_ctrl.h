@@ -96,6 +96,8 @@ private:
     float stall_baseline_temp_{};
     int64_t stall_check_time_{};
 
+    int64_t ws_watchdog_time_{};
+
     bool fan_status_{};
     int64_t fan_on_time_{};
     bool fan_speed_ok_{};

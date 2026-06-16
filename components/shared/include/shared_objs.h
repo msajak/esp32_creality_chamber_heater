@@ -9,6 +9,7 @@ struct Params {
     int temp{};
     int time{};
     bool clear_fault{};
+    bool watchdog_refresh{};
 };
 
 enum class FaultReason: uint16_t {
@@ -20,7 +21,8 @@ enum class FaultReason: uint16_t {
     TEMP_FILT_RANGE = 1 << 4,
     TEMP_STUCK      = 1 << 5,
     FAN_TIMEOUT     = 1 << 6,
-    FAN_DROP        = 1 << 7
+    FAN_DROP        = 1 << 7,
+    TEMP_OVERTEMP   = 1 << 8
 };
 
 struct Status {

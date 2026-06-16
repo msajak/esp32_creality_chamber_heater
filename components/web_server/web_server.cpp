@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "wifi_mgmt.h"
 #include "ota.h"
 #include "cJSON.h"
@@ -43,6 +44,7 @@ esp_err_t WebServer::api_params_get_handler(httpd_req_t *req) {
 
             int temp{}, time{};
             bool clear_fault = false;
+            bool watchdog_refresh = false;
 
             if (!parseParam("temp", [&](const char* str_val){
                 temp = atoi(str_val);
@@ -75,22 +77,41 @@ esp_err_t WebServer::api_params_get_handler(httpd_req_t *req) {
                 fail = true;
             }
 
+            if (!parseParam("watchdog_refresh", [&](const char* str_val){
+                bool ok{};
+                if (strcmp(str_val, "true") == 0) {
+                    watchdog_refresh = true;
+                    ok = true;
+                } else if (strcmp(str_val, "false") == 0) {
+                    watchdog_refresh = false;
+                    ok = true;
+                }
+                return ok;
+            }, true)) {
+                ESP_LOGW("HTTPD_params", "Invalid watchdog_refresh");
+                fail = true;
+            }
+
             auto validate_params = [](const Params& p) {
+                if (p.watchdog_refresh) return true;
                 return (p.temp == 0 && p.time == 0) || (p.temp >= 20 && p.temp <= 70 && p.time > 0 && p.time <= 600);
             };
 
             if (!fail) {
-                Params params{.temp=temp, .time=time, .clear_fault = clear_fault};
+                Params params{.temp=temp, .time=time, .clear_fault = clear_fault, .watchdog_refresh = watchdog_refresh};
                 if (!validate_params(params)) {
                     ESP_LOGW("HTTPD_params", "Invalid Params temp=%d, time=%d, setting to 0", params.temp, params.time);
                     params.temp = 0;
                     params.time = 0;
                     params.clear_fault = false;
+                    params.watchdog_refresh = false;
                 };
                 if (xQueueOverwrite(params_queue, &params) == pdPASS) {
-                    ESP_LOGI("HTTPD_params", "Params temp=%d, time=%d clear_fault=%d queued", params.temp, params.time, params.clear_fault);
-                    char resp[100];
-                    sprintf(resp, "Stored params: temp=%d, time=%d clear_fault=%d\n", params.temp, params.time, params.clear_fault);
+                    ESP_LOGI("HTTPD_params", "Params temp=%d, time=%d clear_fault=%d watchdog_refresh=%d queued",
+                             params.temp, params.time, params.clear_fault, params.watchdog_refresh);
+                    char resp[128];
+                    sprintf(resp, "Stored params: temp=%d, time=%d clear_fault=%d watchdog_refresh=%d\n",
+                            params.temp, params.time, params.clear_fault, params.watchdog_refresh);
                     httpd_resp_send(req, resp, strlen(resp));
                 } else {
                     ESP_LOGE("HTTPD_params", "Queue write failed");
@@ -164,6 +185,7 @@ esp_err_t WebServer::api_status_get_handler(httpd_req_t *req) {
         cJSON_AddNumberToObject(root, "last_rise_fan2", last_status.last_rise_fan2);
         cJSON_AddNumberToObject(root, "edge_count_fan2", last_status.edge_count_fan2);
         cJSON_AddStringToObject(root, "fault_reason", to_string(last_status.fault_reason).c_str());
+        cJSON_AddStringToObject(root, "version", version_);
 
         char *json_str = cJSON_Print(root);
         httpd_resp_set_type(req, "application/json");
@@ -221,99 +243,243 @@ esp_err_t WebServer::api_logs_clear_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+void WebServer::handle_panda_settings(const char *json_str) {
+    cJSON *root = cJSON_Parse(json_str);
+    if (!root) {
+        ESP_LOGW(TAG, "WS: failed to parse JSON");
+        return;
+    }
+
+    cJSON *settings = cJSON_GetObjectItem(root, "settings");
+    if (!cJSON_IsObject(settings)) {
+        ESP_LOGW(TAG, "WS: missing or invalid 'settings' key");
+        cJSON_Delete(root);
+        return;
+    }
+
+    cJSON *item;
+    bool should_apply = false;
+
+    if ((item = cJSON_GetObjectItem(settings, "work_mode")) && cJSON_IsNumber(item))
+        panda_state_.work_mode = item->valueint;
+    if ((item = cJSON_GetObjectItem(settings, "set_temp")) && cJSON_IsNumber(item))
+        panda_state_.set_temp = item->valueint;
+    if ((item = cJSON_GetObjectItem(settings, "temp")) && cJSON_IsNumber(item))
+        panda_state_.temp = item->valueint;
+    if ((item = cJSON_GetObjectItem(settings, "filtertemp")) && cJSON_IsNumber(item))
+        panda_state_.filtertemp = item->valueint;
+    if ((item = cJSON_GetObjectItem(settings, "hotbedtemp")) && cJSON_IsNumber(item))
+        panda_state_.hotbedtemp = item->valueint;
+    if ((item = cJSON_GetObjectItem(settings, "isrunning")) && cJSON_IsNumber(item))
+        panda_state_.isrunning = (item->valueint != 0);
+    if ((item = cJSON_GetObjectItem(settings, "filament_temp")) && cJSON_IsNumber(item))
+        panda_state_.filament_temp = item->valueint;
+    if ((item = cJSON_GetObjectItem(settings, "filament_timer")) && cJSON_IsNumber(item))
+        panda_state_.filament_timer = item->valueint;
+    if ((item = cJSON_GetObjectItem(settings, "custom_temp")) && cJSON_IsNumber(item))
+        panda_state_.custom_temp = item->valueint;
+    if ((item = cJSON_GetObjectItem(settings, "custom_timer")) && cJSON_IsNumber(item))
+        panda_state_.custom_timer = item->valueint;
+
+    if ((item = cJSON_GetObjectItem(settings, "work_on"))) {
+        if (cJSON_IsBool(item))
+            panda_state_.work_on = cJSON_IsTrue(item);
+        else if (cJSON_IsNumber(item))
+            panda_state_.work_on = (item->valueint != 0);
+        should_apply = true;
+    }
+
+    cJSON_Delete(root);
+
+    if (should_apply)
+        apply_panda_state();
+}
+
+void WebServer::apply_panda_state(bool watchdog_refresh) {
+    Params params{};
+
+    if (panda_state_.work_on) {
+        int target = 0;
+        switch (panda_state_.work_mode) {
+            case 1: target = panda_state_.temp; break;
+            case 2: target = panda_state_.set_temp; break;
+            case 3: target = panda_state_.filament_temp > 0
+                           ? panda_state_.filament_temp
+                           : panda_state_.custom_temp; break;
+        }
+        if (target < 0) target = 0;
+        if (target > 80) target = 80;
+        params.temp = target;
+        params.time = 0;
+        params.clear_fault = !watchdog_refresh;
+        params.watchdog_refresh = watchdog_refresh;
+    }
+
+    if (xQueueOverwrite(params_queue, &params) == pdPASS) {
+        if (watchdog_refresh) {
+            ESP_LOGD(TAG, "Panda: watchdog refresh");
+        } else {
+            ESP_LOGI(TAG, "Panda: work_on=%d mode=%d temp=%d",
+                     panda_state_.work_on, panda_state_.work_mode, params.temp);
+        }
+    }
+}
+
+esp_err_t WebServer::send_panda_state(httpd_req_t *req) {
+    Status status{};
+    bool have_status = xQueuePeek(status_queue, &status, 0) == pdTRUE;
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *settings = cJSON_CreateObject();
+
+    if (have_status) {
+        cJSON_AddNumberToObject(settings, "cal_warehouse_temp", status.temp_filtered);
+        cJSON_AddNumberToObject(settings, "warehouse_temper", status.temp_ntc);
+    }
+    cJSON_AddNumberToObject(settings, "work_mode", panda_state_.work_mode);
+    cJSON_AddBoolToObject(settings, "work_on", panda_state_.work_on);
+    cJSON_AddNumberToObject(settings, "set_temp", panda_state_.set_temp);
+    cJSON_AddNumberToObject(settings, "temp", panda_state_.temp);
+    cJSON_AddNumberToObject(settings, "filtertemp", panda_state_.filtertemp);
+    cJSON_AddNumberToObject(settings, "hotbedtemp", panda_state_.hotbedtemp);
+    cJSON_AddNumberToObject(settings, "isrunning", panda_state_.isrunning ? 1 : 0);
+    cJSON_AddNumberToObject(settings, "remaining_seconds", 0);
+    cJSON_AddStringToObject(settings, "fw_version", "V1.0.3");
+    cJSON_AddNumberToObject(settings, "printer_type", 2);
+
+    cJSON_AddItemToObject(root, "settings", settings);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return ESP_ERR_NO_MEM;
+
+    ESP_LOGD(TAG, "WS TX: %s", json);
+
+    httpd_ws_frame_t frame{};
+    frame.type = HTTPD_WS_TYPE_TEXT;
+    frame.payload = reinterpret_cast<uint8_t*>(json);
+    frame.len = strlen(json);
+
+    esp_err_t ret = httpd_ws_send_frame(req, &frame);
+    free(json);
+    return ret;
+}
+
+void WebServer::send_panda_state_async() {
+    if (!server) return;
+
+    size_t max_clients = max_open_sockets_;
+    int fds[max_clients];
+    if (httpd_get_client_list(server, &max_clients, fds) != ESP_OK || max_clients == 0)
+        return;
+
+    char *json = nullptr;
+
+    for (size_t i = 0; i < max_clients; i++) {
+        httpd_ws_client_info_t info = httpd_ws_get_fd_info(server, fds[i]);
+        ESP_LOGD(TAG, "WS broadcast: fd=%d info=%d", fds[i], info);
+        if (info != HTTPD_WS_CLIENT_WEBSOCKET)
+            continue;
+
+        if (!json) {
+            Status status{};
+            bool have_status = xQueuePeek(status_queue, &status, 0) == pdTRUE;
+
+            cJSON *root = cJSON_CreateObject();
+            cJSON *settings = cJSON_CreateObject();
+            if (have_status) {
+                cJSON_AddNumberToObject(settings, "cal_warehouse_temp", status.temp_filtered);
+                cJSON_AddNumberToObject(settings, "warehouse_temper", status.temp_ntc);
+            }
+            cJSON_AddNumberToObject(settings, "work_mode", panda_state_.work_mode);
+            cJSON_AddBoolToObject(settings, "work_on", panda_state_.work_on);
+            cJSON_AddNumberToObject(settings, "set_temp", panda_state_.set_temp);
+            cJSON_AddNumberToObject(settings, "temp", panda_state_.temp);
+            cJSON_AddNumberToObject(settings, "filtertemp", panda_state_.filtertemp);
+            cJSON_AddNumberToObject(settings, "hotbedtemp", panda_state_.hotbedtemp);
+            cJSON_AddNumberToObject(settings, "isrunning", panda_state_.isrunning ? 1 : 0);
+            cJSON_AddNumberToObject(settings, "remaining_seconds", 0);
+            cJSON_AddStringToObject(settings, "fw_version", "V1.0.3");
+            cJSON_AddNumberToObject(settings, "printer_type", 2);
+            cJSON_AddItemToObject(root, "settings", settings);
+
+            json = cJSON_PrintUnformatted(root);
+            cJSON_Delete(root);
+            if (!json) return;
+        }
+
+        if (panda_state_.work_on)
+            apply_panda_state(true);
+
+        httpd_ws_frame_t frame{};
+        frame.type = HTTPD_WS_TYPE_TEXT;
+        frame.payload = reinterpret_cast<uint8_t*>(json);
+        frame.len = strlen(json);
+        httpd_ws_send_frame_async(server, fds[i], &frame);
+    }
+
+    free(json);
+}
+
+static esp_err_t send_ws_text(httpd_req_t *req, const char *text) {
+    httpd_ws_frame_t frame{};
+    frame.type = HTTPD_WS_TYPE_TEXT;
+    frame.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(text));
+    frame.len = strlen(text);
+    ESP_LOGI(TAG, "WS TX: %s", text);
+    return httpd_ws_send_frame(req, &frame);
+}
+
 esp_err_t WebServer::websocket_handler(httpd_req_t *req) {
-    // If this is the initial HTTP GET handshake request, just return ESP_OK to upgrade
     if (req->method == HTTP_GET) {
-        ESP_LOGI(TAG, "Handshake received, upgrading connection to WebSocket");
+        ESP_LOGI(TAG, "WS handshake received");
         return ESP_OK;
     }
 
-    // Loop indefinitely to keep the connection alive and process incoming data
-    while (true) {
-        httpd_ws_frame_t ws_pkt;
-        memset(&ws_pkt, 0, sizeof(ws_pkt));
-        ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+    char rx_buf[512];
+    httpd_ws_frame_t ws_pkt{};
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+    ws_pkt.payload = reinterpret_cast<uint8_t*>(rx_buf);
 
-        // 1. Read frame header (with a 0-byte payload buffer to get length/type)
-        // Note: This will block until a frame arrives or the socket times out
-        esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
-        if (ret == ESP_ERR_TIMEOUT) {
-            continue; // Keep looping if no data arrived within the timeout window
-        } else if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "WebSocket recv header failed: %s", esp_err_to_name(ret));
-            return ret;
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, sizeof(rx_buf) - 1);
+    if (ret != ESP_OK || ws_pkt.len == 0)
+        return ret;
+
+    rx_buf[ws_pkt.len] = '\0';
+    ESP_LOGI(TAG, "WS RX: %s", rx_buf);
+
+    cJSON *root = cJSON_Parse(rx_buf);
+    if (!root) {
+        ESP_LOGW(TAG, "WS: failed to parse JSON");
+        return ESP_OK;
+    }
+
+    if (cJSON_GetObjectItem(root, "settings")) {
+        char *settings_json = cJSON_PrintUnformatted(root);
+        if (settings_json) {
+            handle_panda_settings(settings_json);
+            free(settings_json);
         }
-
-        ESP_LOGD(TAG, "WebSocket frame: type=%d, len=%zu, fin=%d", ws_pkt.type, ws_pkt.len, ws_pkt.final);
-
-        // 2. Handle control frames
-        if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
-            ESP_LOGI(TAG, "WebSocket client requested close");
-            httpd_ws_frame_t close_frame;
-            memset(&close_frame, 0, sizeof(close_frame));
-            close_frame.type = HTTPD_WS_TYPE_CLOSE;
-            httpd_ws_send_frame(req, &close_frame);
-            return ESP_OK; // Exit the loop and handler cleanly
-        }
-
-        if (ws_pkt.type == HTTPD_WS_TYPE_PING) {
-            ESP_LOGI(TAG, "WebSocket ping received, sending pong");
-            httpd_ws_frame_t pong_frame;
-            memset(&pong_frame, 0, sizeof(pong_frame));
-            pong_frame.type = HTTPD_WS_TYPE_PONG;
-            ret = httpd_ws_send_frame(req, &pong_frame);
-            if (ret != ESP_OK) return ret;
-            continue;
-        }
-
-        if (ws_pkt.type == HTTPD_WS_TYPE_PONG) {
-            ESP_LOGD(TAG, "WebSocket pong received");
-            continue;
-        }
-
-        // Handle zero-length data frames
-        if (ws_pkt.len == 0) {
-            continue;
-        }
-
-        if (ws_pkt.len > 4096) {
-            ESP_LOGW(TAG, "WebSocket frame too large (%zu > 4096)", ws_pkt.len);
-            return ESP_ERR_INVALID_SIZE;
-        }
-
-        // 3. Allocate and read the payload data
-        char *buf = static_cast<char*>(malloc(ws_pkt.len + 1));
-        if (!buf) {
-            ESP_LOGE(TAG, "Failed to allocate %zu bytes for payload", ws_pkt.len);
-            return ESP_ERR_NO_MEM;
-        }
-
-        ws_pkt.payload = reinterpret_cast<uint8_t*>(buf);
-        ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "WebSocket recv payload failed: %s", esp_err_to_name(ret));
-            free(buf);
-            return ret;
-        }
-
-        buf[ws_pkt.len] = '\0';
-        ESP_LOGI(TAG, "WebSocket RX (%zu bytes, type=%d): %s", ws_pkt.len, ws_pkt.type, buf);
-
-        // 4. Echo the text back to client
-        httpd_ws_frame_t out_pkt;
-        memset(&out_pkt, 0, sizeof(out_pkt));
-        out_pkt.payload = reinterpret_cast<uint8_t*>(buf);
-        out_pkt.len = ws_pkt.len;
-        out_pkt.type = HTTPD_WS_TYPE_TEXT;
-
-        ret = httpd_ws_send_frame(req, &out_pkt);
-        free(buf);
-
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "WebSocket send failed: %s", esp_err_to_name(ret));
-            return ret;
+        if (cJSON_GetObjectItem(cJSON_GetObjectItem(root, "settings"), "printer_type")) {
+            send_ws_text(req, "{\"response\":{\"type\":\"printer_type\",\"ok\":1}}");
         }
     }
+
+    cJSON *printer = cJSON_GetObjectItem(root, "printer");
+    if (printer) {
+        if (cJSON_GetObjectItem(printer, "disconnect")) {
+            ESP_LOGI(TAG, "WS: printer disconnect (stub)");
+            send_ws_text(req, "{\"printer\":{\"state\":0}}");
+        } else if (cJSON_GetObjectItem(printer, "ip") || cJSON_GetObjectItem(printer, "name")) {
+            ESP_LOGI(TAG, "WS: printer bind (stub)");
+            send_ws_text(req, "{\"printer\":{\"state\":3}}");
+        }
+    }
+
+    cJSON_Delete(root);
+
+    send_panda_state(req);
+    return ESP_OK;
 }
 
 WebServer::~WebServer() {
@@ -327,6 +493,9 @@ void WebServer::start() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 14;
     config.stack_size = 8192;
+    config.lru_purge_enable = true;
+    config.keep_alive_enable = true;
+    max_open_sockets_ = config.max_open_sockets;
 
     if (server) {
         ESP_LOGE(TAG, "HTTP server already started");
@@ -338,43 +507,59 @@ void WebServer::start() {
         return;
     }
 
+    auto make_uri = [this](const char *path, httpd_method_t method, esp_err_t (*fn)(httpd_req_t *), bool ws = false) {
+        httpd_uri_t u = {};
+        u.uri = path;
+        u.method = method;
+        u.handler = fn;
+        u.user_ctx = this;
+        u.is_websocket = ws;
+        return u;
+    };
+
     httpd_uri_t uris[] = {
-        {.uri = "/", .method = HTTP_GET,  .handler = [](httpd_req_t *req) {
-            WebServer* instance = static_cast<WebServer*>(req->user_ctx);
-            return instance->root_get_handler(req);
-        }, .user_ctx = this},
-        {.uri = "/api/params", .method = HTTP_GET, .handler = [](httpd_req_t *req) {
-            WebServer* instance = static_cast<WebServer*>(req->user_ctx);
-            return instance->api_params_get_handler(req);
-        }, .user_ctx = this},
-        {.uri = "/api/status", .method = HTTP_GET, .handler = [](httpd_req_t *req) {
-            WebServer* instance = static_cast<WebServer*>(req->user_ctx);
-            return instance->api_status_get_handler(req);
-        }, .user_ctx = this},
-        {.uri = "/api/wifi/config", .method = HTTP_POST, .handler = [](httpd_req_t *req) {
-            WebServer* instance = static_cast<WebServer*>(req->user_ctx);
-            return instance->api_wifi_post_handler(req);
-        }, .user_ctx = this},
-        {.uri = "/api/ota/update",  .method = HTTP_POST, .handler = [](httpd_req_t *req) {
-            WebServer* instance = static_cast<WebServer*>(req->user_ctx);
-            return instance->api_ota_post_handler(req);
-        }, .user_ctx = this},
-        {.uri = "/api/logs", .method = HTTP_GET, .handler = [](httpd_req_t *req) {
-            WebServer* instance = static_cast<WebServer*>(req->user_ctx);
-            return instance->api_logs_get_handler(req);
-        }, .user_ctx = this},
-        {.uri = "/api/logs/clear", .method = HTTP_POST, .handler = [](httpd_req_t *req) {
-            WebServer* instance = static_cast<WebServer*>(req->user_ctx);
-            return instance->api_logs_clear_handler(req);
-        }, .user_ctx = this},
-        {.uri = "/ws",  .method = HTTP_GET, .handler = [](httpd_req_t *req) {
-            WebServer* instance = static_cast<WebServer*>(req->user_ctx);
-            return instance->websocket_handler(req);
-        }, .user_ctx = this, .is_websocket = true}
+        make_uri("/", HTTP_GET, [](httpd_req_t *req) {
+            return static_cast<WebServer*>(req->user_ctx)->root_get_handler(req);
+        }),
+        make_uri("/api/params", HTTP_GET, [](httpd_req_t *req) {
+            return static_cast<WebServer*>(req->user_ctx)->api_params_get_handler(req);
+        }),
+        make_uri("/api/status", HTTP_GET, [](httpd_req_t *req) {
+            return static_cast<WebServer*>(req->user_ctx)->api_status_get_handler(req);
+        }),
+        make_uri("/api/wifi/config", HTTP_POST, [](httpd_req_t *req) {
+            return static_cast<WebServer*>(req->user_ctx)->api_wifi_post_handler(req);
+        }),
+        make_uri("/api/ota/update", HTTP_POST, [](httpd_req_t *req) {
+            return static_cast<WebServer*>(req->user_ctx)->api_ota_post_handler(req);
+        }),
+        make_uri("/api/logs", HTTP_GET, [](httpd_req_t *req) {
+            return static_cast<WebServer*>(req->user_ctx)->api_logs_get_handler(req);
+        }),
+        make_uri("/api/logs/clear", HTTP_POST, [](httpd_req_t *req) {
+            return static_cast<WebServer*>(req->user_ctx)->api_logs_clear_handler(req);
+        }),
+        make_uri("/ws", HTTP_GET, [](httpd_req_t *req) {
+            return static_cast<WebServer*>(req->user_ctx)->websocket_handler(req);
+        }, true),
     };
 
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);
+    }
+
+    esp_timer_create_args_t timer_args = {
+        .callback = [](void* arg) {
+            static_cast<WebServer*>(arg)->send_panda_state_async();
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "ws_broadcast",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_handle_t ws_timer;
+    if (esp_timer_create(&timer_args, &ws_timer) == ESP_OK) {
+        esp_timer_start_periodic(ws_timer, 2000000);
     }
 
     ESP_LOGI(TAG, "HTTP server started");

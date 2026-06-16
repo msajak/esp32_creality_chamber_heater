@@ -1,5 +1,5 @@
-
 #pragma once
+#include <utility>
 
 template <typename F>
 class ScopeGuard {

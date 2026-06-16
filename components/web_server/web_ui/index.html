@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ESP32 Chamber Heater Controller</title>
+<title>ESP32 Creality Panda Breath</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:16px;max-width:1600px;margin:0 auto}
@@ -29,7 +29,7 @@ input[type=file]{margin-bottom:8px}
 </style>
 </head>
 <body>
-<h1>ESP32 Chamber Heater Controller</h1>
+<h1>ESP32 Creality Panda Breath <span id="app-version" style="font-size:0.6em;color:#888"></span></h1>
 
 <div class="card" id="status-card">
   <h2>Status</h2>
@@ -68,10 +68,13 @@ input[type=file]{margin-bottom:8px}
 
 <div class="card">
   <h2>System Logs</h2>
-  <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+  <div style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;">
     <input type="number" id="max-logs" placeholder="Max entries (0=all)" min="0" value="100" style="max-width: 150px; flex: 1;">
     <button class="btn-primary" onclick="loadLogs()">Refresh</button>
     <button class="btn-danger" onclick="clearLogs()">Clear</button>
+    <label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer;white-space:nowrap"><input type="checkbox" id="logs-auto" checked> Auto</label>
+    <input type="number" id="logs-interval" min="500" step="500" value="5000" style="max-width:80px" title="Auto-refresh interval (ms)">
+    <span style="font-size:.8em;color:#a0a0a0">ms</span>
   </div>
   <div id="logs-list" style="background: #0a0a0a; border: 1px solid #0f3460; border-radius: 4px; padding: 8px; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.8em; line-height: 1.4; white-space: pre-wrap; word-break: break-word;">
     <div style="color: #666;">Loading logs...</div>
@@ -112,6 +115,9 @@ async function loadStatus() {
   $('st-fan1').textContent = s.edge_count_fan1;
   $('st-fan2').textContent = s.edge_count_fan2;
   $('st-fault').textContent = s.fault_reason;
+  if (s.version) {
+    $('app-version').textContent = s.version;
+  }
 }
 
 async function setWifi() {
@@ -192,9 +198,12 @@ async function clearLogs() {
   }
 }
 
-// Load logs on page load and auto-refresh every 2 seconds
 loadLogs();
-setInterval(loadLogs, 2000);
+let logsTimer = setInterval(() => { if ($('logs-auto').checked) loadLogs(); }, 5000);
+$('logs-interval').addEventListener('change', function() {
+  clearInterval(logsTimer);
+  logsTimer = setInterval(() => { if ($('logs-auto').checked) loadLogs(); }, Math.max(500, parseInt(this.value) || 5000));
+});
 </script>
 </body>
 </html>

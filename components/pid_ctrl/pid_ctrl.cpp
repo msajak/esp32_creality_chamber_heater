@@ -1,4 +1,3 @@
-
 #include "freertos/FreeRTOS.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_cali.h"
@@ -27,17 +26,19 @@ static constexpr ledc_timer_bit_t PWM_RESOLUTION = LEDC_TIMER_10_BIT;
 static constexpr int PWM_MAX            = (1 << 10) - 1;
 
 // PID and control timings (ms)
-static constexpr int64_t US_PER_SEC       = 1000000;
-static constexpr int64_t PID_INTERVAL_US  = 1 * US_PER_SEC;
-static constexpr int64_t FAN_COOLDOWN_US  = 60 * US_PER_SEC;
-static constexpr int64_t STALL_TIMEOUT_US = 180 * US_PER_SEC; // 3min
-static constexpr int64_t FAN_SPINUP_US    = 5 * US_PER_SEC;
+static constexpr int64_t US_PER_SEC            = 1000000;
+static constexpr int64_t PID_INTERVAL_US       = 1 * US_PER_SEC;
+static constexpr int64_t FAN_COOLDOWN_US       = 60 * US_PER_SEC;
+static constexpr int64_t STALL_TIMEOUT_US      = 300 * US_PER_SEC; // 5min
+static constexpr int64_t FAN_SPINUP_US         = 5 * US_PER_SEC;
+static constexpr int64_t WS_WATCHDOG_TIMEOUT_US = 300 * US_PER_SEC; // 5min
 
 // Temperature range and thresholds
 static constexpr float TEMP_SMOOTH_ALPHA  = 0.5; // Smoothing factor (0.0 to 1.0)
 static constexpr uint16_t FILTER_MIN_LOOPS  = 10;
 static constexpr float TEMP_RANGE_MIN     = 1.0f;
 static constexpr float TEMP_RANGE_MAX     = 150.0f;
+static constexpr float TEMP_OVERTEMP       = 85.0f;
 static constexpr float STALL_MIN_RISE     = 1.0f;
 static constexpr uint32_t STALL_MIN_DUTY  = (uint32_t)(PWM_MAX * 0.5f);
 static constexpr float STALL_ERROR_THRESH = 5.0f;
@@ -163,38 +164,35 @@ void PidCtrl::init_adc() {
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle_));
 
     adc_oneshot_chan_cfg_t config = {
-        .atten = ADC_ATTEN_DB_11,
+        .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle_, THERMISTOR_ADC_CH, &config));
 
     adc_cali_line_fitting_config_t cali_config{};
     cali_config.unit_id = ADC_UNIT_1;
-    cali_config.atten = ADC_ATTEN_DB_11;
+    cali_config.atten = ADC_ATTEN_DB_12;
     cali_config.bitwidth = ADC_BITWIDTH_DEFAULT;
     ESP_ERROR_CHECK(adc_cali_create_scheme_line_fitting(&cali_config, &cali_handle_));
 }
 
 void PidCtrl::init_pwm() {
-    ledc_timer_config_t timer = {
-        .speed_mode      = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = PWM_RESOLUTION,
-        .timer_num       = LEDC_TIMER_0,
-        .freq_hz         = PWM_FREQ_HZ,
-        .clk_cfg         = LEDC_AUTO_CLK,
-    };
+    ledc_timer_config_t timer{};
+    timer.speed_mode      = LEDC_LOW_SPEED_MODE;
+    timer.duty_resolution = PWM_RESOLUTION;
+    timer.timer_num       = LEDC_TIMER_0;
+    timer.freq_hz         = PWM_FREQ_HZ;
+    timer.clk_cfg         = LEDC_AUTO_CLK;
     ledc_timer_config(&timer);
 
-    ledc_channel_config_t channel = {
-        .gpio_num = MOSFET_GPIO,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = LEDC_CHANNEL_0,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = LEDC_TIMER_0,
-        .duty = 0,
-        .hpoint = 0,
-        .flags = {}
-    };
+    ledc_channel_config_t channel{};
+    channel.gpio_num = MOSFET_GPIO;
+    channel.speed_mode = LEDC_LOW_SPEED_MODE;
+    channel.channel = LEDC_CHANNEL_0;
+    channel.timer_sel = LEDC_TIMER_0;
+    channel.duty = 0;
+    channel.hpoint = 0;
+    channel.flags = {};
     ledc_channel_config(&channel);
 }
 
@@ -389,6 +387,10 @@ void PidCtrl::publish_status() {
 Params PidCtrl::get_params() {
     Params params{};
     if (xQueueReceive(params_queue, &params, 0) == pdTRUE) {
+        if (params.watchdog_refresh) {
+            ws_watchdog_time_ = pid_timenow_;
+            return params;
+        }
         bool keep_integral = pid_state_.setpoint > 30.0f && std::abs(pid_state_.setpoint - params.temp) <= 3.0;
         if (!keep_integral) {
             pid_state_.integral = 0.0f;
@@ -404,6 +406,7 @@ Params PidCtrl::get_params() {
         fan_speed_ok_ = false;
         if (params.temp > 0) {
             heater_start_time_ = pid_timenow_;
+            ws_watchdog_time_ = pid_timenow_;
         }
     }
     return params;
@@ -468,6 +471,13 @@ void PidCtrl::pid_loop() {
 
         temp_ntc_c_ = read_temperature();
 
+        if (!has_fault(FaultReason::TEMP_OVERTEMP) &&
+            (temp_ntc_c_ >= TEMP_OVERTEMP || (temp_filtered_ok && temp_ntc_filtered >= TEMP_OVERTEMP))) {
+            ESP_LOGE(TAG, "FAULT: over-temperature cutoff (raw=%.1f°C filtered=%.1f°C limit=%.0f°C)",
+                     temp_ntc_c_, temp_ntc_filtered, TEMP_OVERTEMP);
+            set_fault(FaultReason::TEMP_OVERTEMP);
+        }
+
         heating_active_ = !has_fault() && pid_state_.setpoint > 0.0f;
 
         if (heating_active_) {
@@ -482,6 +492,15 @@ void PidCtrl::pid_loop() {
                     heater_timeout_sec_ = 0;
                 }
                 heating_time_left_sec_ = (heater_timeout_us - elapsed_us) / US_PER_SEC;
+            } else if (ws_watchdog_time_ > 0) {
+                int64_t ws_elapsed = pid_timenow_ - ws_watchdog_time_;
+                if (ws_elapsed > WS_WATCHDOG_TIMEOUT_US) {
+                    ESP_LOGW(TAG, "WS watchdog timeout (%.0fs) — switching off heater",
+                             (float)ws_elapsed / US_PER_SEC);
+                    pid_state_.reset_setpoint();
+                    set_fault(FaultReason::HEAT_TIMEOUT);
+                    ws_watchdog_time_ = 0;
+                }
             } else {
                 ESP_LOGW(TAG, "No safety timeout — switching off heater, elapsed_us=%lld timenow %lld heater_start_time %lld", elapsed_us, pid_timenow_, heater_start_time_);
                 pid_state_.reset_setpoint();
@@ -506,12 +525,8 @@ void PidCtrl::pid_loop() {
                 if (!temp_filtered_ok) {
                     if (temp_filter_warmup_loops < FILTER_MIN_LOOPS) {
                         ++temp_filter_warmup_loops;
-                        if (!has_fault(FaultReason::TEMP_FILT)) {
-                            set_fault(FaultReason::TEMP_FILT);
-                        }
                     } else {
                         temp_filtered_ok = true;
-                        clear_fault(FaultReason::TEMP_FILT);
                         ESP_LOGI(TAG, "temp_ntc_filtered stabilized at %.1f°C", temp_ntc_filtered);
                     }
                 }
@@ -569,10 +584,10 @@ void PidCtrl::pid_loop() {
 
     publish_status();
 
-    ESP_LOGI(TAG, "fault=%s T=%.1f°C Tf=%.1f°C fw=%d set=%.1f°C err=%.1f I=%.1f heat=%s duty=%lu/%d heat_timeout=%lu, heat_time_left=%lu, fans=%s fans_speed=%s, sensors [lvl/last_rise/edges] fan1: [%d/%lld/%lld] fan2: [%d/%lld/%lld]",
-                to_string(fault_reason_).c_str(),
-                temp_ntc_c_, temp_ntc_filtered, temp_filter_warmup_loops, pid_state_.setpoint, pid_state_.setpoint - temp_ntc_c_, pid_state_.integral,
-                heating_active_ ? "ON" : "OFF", (unsigned long)duty_cycle_, PWM_MAX, heater_timeout_sec_, heating_time_left_sec_,
+    ESP_LOGI(TAG, "fault=%s heat=%s DUTY=%lu/%d T=%.1f°C Tf=%.1f°C set=%.1f°C err=%.1f pid_I=%.1f heat_timeout=%lu, heat_time_left=%lu, fans=%s fans_speed=%s, sensors [lvl/last_rise/edges] fan1: [%d/%lld/%lld] fan2: [%d/%lld/%lld]",
+                to_string(fault_reason_).c_str(), heating_active_ ? "ON" : "OFF", (unsigned long)duty_cycle_, PWM_MAX,
+                temp_ntc_c_, temp_ntc_filtered, pid_state_.setpoint, pid_state_.setpoint - temp_ntc_c_,
+                pid_state_.integral, heater_timeout_sec_, heating_time_left_sec_,
                 fan_status_ ? "ON" : "OFF", fan_state_.fans_nominal ? "OK" : "BAD", fan_state_.fan1_sensor, fan_state_.fan1_last_edge, fan_state_.fan1_edges, fan_state_.fan2_sensor, fan_state_.fan2_last_edge, fan_state_.fan2_edges
             );
 

@@ -12,6 +12,7 @@ std::string to_string(FaultReason fault_reason) {
     if (check_fault_reason(fault_reason, FaultReason::TEMP_STUCK))      result += "TEMP_STUCK | ";
     if (check_fault_reason(fault_reason, FaultReason::FAN_TIMEOUT))     result += "FAN_TIMEOUT | ";
     if (check_fault_reason(fault_reason, FaultReason::FAN_DROP))        result += "FAN_DROP | ";
+    if (check_fault_reason(fault_reason, FaultReason::TEMP_OVERTEMP))  result += "TEMP_OVERTEMP | ";
 
     if (!result.empty()) {
         result.erase(result.length() - 3);

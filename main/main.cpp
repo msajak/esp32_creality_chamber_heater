@@ -19,11 +19,12 @@ extern "C" {
 
 QueueHandle_t params_queue;
 QueueHandle_t status_queue;
+const char* APP_VERSION = "0.95";
 
 static constexpr const char* TAG = "MAIN";
 
 void app_main(void) {
-    ESP_LOGI(TAG, "ESP32 Chamber Heater Controller starting...");
+    ESP_LOGI(TAG, "ESP32 Creality Panda Breath starting...");
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -52,10 +53,10 @@ void app_main(void) {
     WifiMgmt wifi_mgmt;
     wifi_mgmt.start();
 
-    WebServer server(params_queue, status_queue, wifi_mgmt);
+    WebServer server(params_queue, status_queue, wifi_mgmt, APP_VERSION);
     server.start();
 
-    ESP_LOGI(TAG, "ESP32 Chamber Heater Controller started. Web UI at http://%s/", wifi_mgmt.get_ip());
+    ESP_LOGI(TAG, "ESP32 Creality Panda Breath started. Web UI at http://%s/", wifi_mgmt.get_ip());
 
     PidCtrl pid_ctrl(params_queue, status_queue);
     if (!pid_ctrl.start()) {
