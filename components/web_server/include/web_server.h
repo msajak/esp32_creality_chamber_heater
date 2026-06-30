@@ -7,19 +7,7 @@
 class Params;
 class WifiMgmt;
 
-struct PandaState {
-    int work_mode = 2;     // 1=auto, 2=always_on, 3=filament_drying
-    bool work_on = false;
-    int set_temp = 0;      // target for work_mode 2
-    int temp = 0;          // target for work_mode 1 (auto)
-    int filtertemp = 30;
-    int hotbedtemp = 80;
-    bool isrunning = false;
-    int filament_temp = 55;
-    int filament_timer = 6;
-    int custom_temp = 55;
-    int custom_timer = 6;
-};
+
 
 class WebServer {
 

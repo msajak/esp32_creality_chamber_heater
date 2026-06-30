@@ -230,6 +230,7 @@ void PidCtrl::init_fan() {
 
 void PidCtrl::set_fault(FaultReason fault) {
     fault_reason_ = fault_reason_ | fault;
+    fault_history_ = fault_history_ | fault;
 }
 
 void PidCtrl::clear_fault(FaultReason fault) {
@@ -378,6 +379,11 @@ void PidCtrl::publish_status() {
     current_status.last_rise_fan2 = fan_state_.fan2_last_edge;
     current_status.edge_count_fan2 = fan_state_.fan2_edges;
     current_status.fault_reason = fault_reason_;
+    current_status.fault_history = fault_history_;
+
+    current_status.panda_work_mode = last_panda_state_.work_mode;
+    current_status.panda_work_on = last_panda_state_.work_on;
+    current_status.panda_isrunning = last_panda_state_.isrunning;
 
     if (xQueueOverwrite(status_queue, &current_status) != pdPASS) {
         ESP_LOGE(TAG, "Status Queue write failed");
@@ -387,6 +393,7 @@ void PidCtrl::publish_status() {
 Params PidCtrl::get_params() {
     Params params{};
     if (xQueueReceive(params_queue, &params, 0) == pdTRUE) {
+        last_panda_state_ = params.panda_state;
         if (params.watchdog_refresh) {
             ws_watchdog_time_ = pid_timenow_;
             return params;
@@ -584,11 +591,13 @@ void PidCtrl::pid_loop() {
 
     publish_status();
 
-    ESP_LOGI(TAG, "fault=%s heat=%s DUTY=%lu/%d T=%.1f°C Tf=%.1f°C set=%.1f°C err=%.1f pid_I=%.1f heat_timeout=%lu, heat_time_left=%lu, fans=%s fans_speed=%s, sensors [lvl/last_rise/edges] fan1: [%d/%lld/%lld] fan2: [%d/%lld/%lld]",
-                to_string(fault_reason_).c_str(), heating_active_ ? "ON" : "OFF", (unsigned long)duty_cycle_, PWM_MAX,
+    ESP_LOGI(TAG, "fault=%s fault_hist=%s heat=%s DUTY=%lu/%d T=%.1f°C Tf=%.1f°C set=%.1f°C err=%.1f pid_I=%.1f heat_timeout=%lu, heat_time_left=%lu, fans=%s fans_speed=%s, panda=[on=%d mode=%d run=%d], fan_sens: [%d %d]",
+                to_string(fault_reason_).c_str(), to_string(fault_history_).c_str(), heating_active_ ? "ON" : "OFF", (unsigned long)duty_cycle_, PWM_MAX,
                 temp_ntc_c_, temp_ntc_filtered, pid_state_.setpoint, pid_state_.setpoint - temp_ntc_c_,
                 pid_state_.integral, heater_timeout_sec_, heating_time_left_sec_,
-                fan_status_ ? "ON" : "OFF", fan_state_.fans_nominal ? "OK" : "BAD", fan_state_.fan1_sensor, fan_state_.fan1_last_edge, fan_state_.fan1_edges, fan_state_.fan2_sensor, fan_state_.fan2_last_edge, fan_state_.fan2_edges
+                fan_status_ ? "ON" : "OFF", fan_state_.fans_nominal ? "OK" : "BAD",
+                last_panda_state_.work_on, last_panda_state_.work_mode, last_panda_state_.isrunning,
+                fan_state_.fan1_sensor, fan_state_.fan2_sensor
             );
 
     gpio_set_level(LED_GPIO, led_state);

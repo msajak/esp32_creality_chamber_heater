@@ -45,7 +45,12 @@ input[type=file]{margin-bottom:8px}
   <div class="status-row"><span>Fan:</span><span class="status-val" id="st-fan">--</span></div>
   <div class="status-row"><span>Fan1 Edges:</span><span class="status-val" id="st-fan1">--</span></div>
   <div class="status-row"><span>Fan2 Edges:</span><span class="status-val" id="st-fan2">--</span></div>
+  <div class="status-row"><span>Uptime:</span><span class="status-val" id="st-uptime">--</span></div>
   <div class="status-row"><span>Fault:</span><span class="status-val" id="st-fault">--</span></div>
+  <div class="status-row"><span>Fault History:</span><span class="status-val" id="st-fault-history">--</span></div>
+  <div class="status-row"><span>Panda Work Mode:</span><span class="status-val" id="st-panda-work-mode">--</span></div>
+  <div class="status-row"><span>Panda Work On:</span><span class="status-val" id="st-panda-work-on">--</span></div>
+  <div class="status-row"><span>Panda IsRunning:</span><span class="status-val" id="st-panda-isrunning">--</span></div>
 </div>
 <div class="card">
   <h2>Wi-Fi Configuration</h2>
@@ -115,6 +120,23 @@ async function loadStatus() {
   $('st-fan1').textContent = s.edge_count_fan1;
   $('st-fan2').textContent = s.edge_count_fan2;
   $('st-fault').textContent = s.fault_reason;
+  $('st-fault-history').textContent = s.fault_history;
+  $('st-heatertimeout').textContent = s.heater_timeout_sec + 's';
+  $('st-heatertimeout').textContent = s.heater_timeout_sec + 's';
+  $('st-panda-work-mode').textContent = s.panda_work_mode;
+  $('st-panda-work-on').textContent = s.panda_work_on;
+  $('st-panda-isrunning').textContent = s.panda_isrunning;
+
+  if (s.timenow) {
+    const uptimeSec = s.timenow / 1000000;
+    const days = Math.floor(uptimeSec / 86400);
+    const hours = Math.floor((uptimeSec % 86400) / 3600);
+    const minutes = Math.floor((uptimeSec % 3600) / 60);
+    $('st-uptime').textContent = days + "d " +
+      String(hours).padStart(2, '0') + ":" +
+      String(minutes).padStart(2, '0');
+  }
+
   if (s.version) {
     $('app-version').textContent = s.version;
   }

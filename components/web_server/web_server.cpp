@@ -185,6 +185,10 @@ esp_err_t WebServer::api_status_get_handler(httpd_req_t *req) {
         cJSON_AddNumberToObject(root, "last_rise_fan2", last_status.last_rise_fan2);
         cJSON_AddNumberToObject(root, "edge_count_fan2", last_status.edge_count_fan2);
         cJSON_AddStringToObject(root, "fault_reason", to_string(last_status.fault_reason).c_str());
+        cJSON_AddStringToObject(root, "fault_history", to_string(last_status.fault_history).c_str());
+        cJSON_AddNumberToObject(root, "panda_work_mode", last_status.panda_work_mode);
+        cJSON_AddBoolToObject(root, "panda_work_on", last_status.panda_work_on);
+        cJSON_AddBoolToObject(root, "panda_isrunning", last_status.panda_isrunning);
         cJSON_AddStringToObject(root, "version", version_);
 
         char *json_str = cJSON_Print(root);
@@ -297,6 +301,7 @@ void WebServer::handle_panda_settings(const char *json_str) {
 
 void WebServer::apply_panda_state(bool watchdog_refresh) {
     Params params{};
+    params.panda_state = panda_state_;
 
     if (panda_state_.work_on) {
         int target = 0;

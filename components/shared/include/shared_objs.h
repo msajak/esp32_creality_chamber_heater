@@ -5,11 +5,26 @@
 #include "freertos/semphr.h"
 #include <string>
 
+struct PandaState {
+    int work_mode = {};     // 1=auto, 2=always_on, 3=filament_drying
+    bool work_on = false;
+    int set_temp = 0;      // target for work_mode 2
+    int temp = 0;          // target for work_mode 1 (auto)
+    int filtertemp = {};
+    int hotbedtemp = {};
+    bool isrunning = false;
+    int filament_temp = {};
+    int filament_timer = {};
+    int custom_temp = {};
+    int custom_timer = {};
+};
+
 struct Params {
     int temp{};
     int time{};
     bool clear_fault{};
     bool watchdog_refresh{};
+    PandaState panda_state{};
 };
 
 enum class FaultReason: uint16_t {
@@ -43,6 +58,10 @@ struct Status {
     int64_t last_rise_fan2;
     int64_t edge_count_fan2;
     FaultReason fault_reason;
+    FaultReason fault_history;
+    int panda_work_mode = {};
+    bool panda_work_on = false;
+    bool panda_isrunning = false;
 };
 
 constexpr FaultReason operator|(FaultReason lhs, FaultReason rhs) {

@@ -93,6 +93,7 @@ private:
     bool heating_active_{};
     bool heating_was_active_{};
     FaultReason fault_reason_{};
+    FaultReason fault_history_{};
     float stall_baseline_temp_{};
     int64_t stall_check_time_{};
 
@@ -111,5 +112,6 @@ private:
 
     uint32_t duty_cycle_ = 0;
 
+    PandaState last_panda_state_{};
     bool led_state{};
 };
