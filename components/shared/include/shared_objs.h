@@ -40,6 +40,23 @@ enum class FaultReason: uint16_t {
     TEMP_OVERTEMP   = 1 << 8
 };
 
+enum class ControllerState : uint8_t {
+    IDLE = 0,
+    HEATING = 1,
+    COOLDOWN = 2,
+    FAULT = 3
+};
+
+inline std::string to_string(ControllerState state) {
+    switch (state) {
+        case ControllerState::IDLE: return "IDLE";
+        case ControllerState::HEATING: return "HEATING";
+        case ControllerState::COOLDOWN: return "COOLDOWN";
+        case ControllerState::FAULT: return "FAULT";
+        default: return "UNKNOWN";
+    }
+}
+
 struct Status {
     int64_t timenow;
     float temp_ntc;
@@ -59,6 +76,7 @@ struct Status {
     int64_t edge_count_fan2;
     FaultReason fault_reason;
     FaultReason fault_history;
+    ControllerState state = ControllerState::IDLE;
     int panda_work_mode = {};
     bool panda_work_on = false;
     bool panda_isrunning = false;

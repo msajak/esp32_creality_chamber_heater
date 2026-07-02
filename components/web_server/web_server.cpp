@@ -189,6 +189,7 @@ esp_err_t WebServer::api_status_get_handler(httpd_req_t *req) {
         cJSON_AddNumberToObject(root, "panda_work_mode", last_status.panda_work_mode);
         cJSON_AddBoolToObject(root, "panda_work_on", last_status.panda_work_on);
         cJSON_AddBoolToObject(root, "panda_isrunning", last_status.panda_isrunning);
+        cJSON_AddStringToObject(root, "controller_state", to_string(last_status.state).c_str());
         cJSON_AddStringToObject(root, "version", version_);
 
         char *json_str = cJSON_Print(root);

@@ -39,6 +39,7 @@ input[type=file]{margin-bottom:8px}
   <div class="status-row"><span>Setpoint:</span><span class="status-val" id="st-setpoint">--</span></div>
   <div class="status-row"><span>TempError:</span><span class="status-val" id="st-temperror">--</span></div>
   <div class="status-row"><span>Heating:</span><span class="status-val" id="st-heating">--</span></div>
+  <div class="status-row"><span>Controller State:</span><span class="status-val" id="st-controller-state">--</span></div>
   <div class="status-row"><span>Duty:</span><span class="status-val" id="st-duty">--</span></div>
   <div class="status-row"><span>Heater Timeout:</span><span class="status-val" id="st-heatertimeout">--</span></div>
   <div class="status-row"><span>Heater Time Left:</span><span class="status-val" id="st-heatertimeleft">--</span></div>
@@ -113,6 +114,7 @@ async function loadStatus() {
   $('st-setpoint').textContent = s.setpoint.toFixed(1) + '°C';
   $('st-temperror').textContent = s.temp_error.toFixed(1) + '°C';
   $('st-heating').textContent = s.heating_active ? 'ON' : 'OFF';
+  $('st-controller-state').textContent = s.controller_state;
   $('st-duty').textContent = s.duty.toFixed(1) + '%';
   $('st-heatertimeout').textContent = s.heater_timeout_sec + 's';
   $('st-heatertimeleft').textContent = s.heater_time_left_sec + 's';

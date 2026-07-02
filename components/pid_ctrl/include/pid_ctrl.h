@@ -34,6 +34,16 @@ private:
     void apply_duty_cycle();
     void publish_status();
 
+    enum class State {
+        IDLE,
+        HEATING,
+        COOLDOWN,
+        FAULT
+    };
+
+    void transition_to(State new_state, const char* reason = nullptr);
+    static const char* state_to_str(State state);
+
     Params get_params();
     float read_temperature();
     void pid_loop();
@@ -91,7 +101,7 @@ private:
     uint32_t heating_time_left_sec_{};
     uint32_t heater_timeout_sec_{};
     bool heating_active_{};
-    bool heating_was_active_{};
+    State state_{State::IDLE};
     FaultReason fault_reason_{};
     FaultReason fault_history_{};
     float stall_baseline_temp_{};

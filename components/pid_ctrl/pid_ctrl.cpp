@@ -231,6 +231,58 @@ void PidCtrl::init_fan() {
 void PidCtrl::set_fault(FaultReason fault) {
     fault_reason_ = fault_reason_ | fault;
     fault_history_ = fault_history_ | fault;
+    transition_to(State::FAULT, "fault set");
+}
+
+void PidCtrl::transition_to(State new_state, const char* reason) {
+    if (state_ == new_state) return;
+    ESP_LOGI(TAG, "State transition: %s -> %s%s%s",
+             state_to_str(state_), state_to_str(new_state),
+             reason && reason[0] != '\0' ? " | Reason: " : "",
+             reason ? reason : "");
+    state_ = new_state;
+
+    // Entry actions for the new state
+    switch (state_) {
+        case State::IDLE:
+            pid_state_.reset_setpoint();
+            duty_cycle_ = 0;
+            heater_timeout_sec_ = 0;
+            heating_time_left_sec_ = 0;
+            stall_check_time_ = 0;
+            break;
+        case State::HEATING:
+            heater_start_time_ = pid_timenow_;
+            ws_watchdog_time_ = pid_timenow_;
+            stall_check_time_ = 0;
+            stall_baseline_temp_ = temp_ntc_filtered;
+            break;
+        case State::COOLDOWN:
+            pid_state_.reset_setpoint();
+            duty_cycle_ = 0;
+            heater_off_time_ = pid_timenow_;
+            heating_time_left_sec_ = 0;
+            break;
+        case State::FAULT:
+            pid_state_.reset_setpoint();
+            duty_cycle_ = 0;
+            heater_timeout_sec_ = 0;
+            heating_time_left_sec_ = 0;
+            stall_check_time_ = 0;
+            pid_state_.integral = 0.0f;
+            pid_state_.prev_error = 0.0f;
+            break;
+    }
+}
+
+const char* PidCtrl::state_to_str(State state) {
+    switch (state) {
+        case State::IDLE: return "IDLE";
+        case State::HEATING: return "HEATING";
+        case State::COOLDOWN: return "COOLDOWN";
+        case State::FAULT: return "FAULT";
+        default: return "UNKNOWN";
+    }
 }
 
 void PidCtrl::clear_fault(FaultReason fault) {
@@ -238,6 +290,9 @@ void PidCtrl::clear_fault(FaultReason fault) {
         fault_reason_ = FaultReason::NONE;
     } else {
         fault_reason_ &= ~fault;
+    }
+    if (fault_reason_ == FaultReason::NONE && state_ == State::FAULT) {
+        transition_to(State::IDLE, "fault cleared");
     }
 }
 
@@ -308,24 +363,12 @@ void PidCtrl::manage_fans() {
         gpio_set_level(FAN_GPIO, on ? 1 : 0);
     };
 
-    if (heating_active_) {
-        set_fan(true, "heating_active");
-        heating_was_active_ = true;
-    } else if (heating_was_active_) {
-        heater_off_time_ = pid_timenow_;
-        heating_was_active_ = false;
-        set_fan(true, "heating_was_active");
+    if (state_ == State::HEATING) {
+        set_fan(true, "HEATING state");
+    } else if (state_ == State::COOLDOWN) {
+        set_fan(true, "COOLDOWN state");
     } else {
-        if (heater_off_time_ != 0) {
-            int64_t elapsed_us = pid_timenow_ - heater_off_time_;
-            if (elapsed_us < FAN_COOLDOWN_US) {
-                set_fan(true, "in_cooldown");
-            } else {
-                set_fan(false, "out_of_cooldown");
-            }
-        } else {
-            set_fan(false, "heater_never_on");
-        }
+        set_fan(false, "IDLE/FAULT state");
     }
 
     fan_state_.fans_nominal = false;
@@ -368,7 +411,7 @@ void PidCtrl::publish_status() {
     current_status.temp_filtered_ok = temp_filtered_ok;
     current_status.setpoint = pid_state_.setpoint;
     current_status.temp_error = pid_state_.setpoint - temp_ntc_c_;
-    current_status.heating_active = heating_active_;
+    current_status.heating_active = (state_ == State::HEATING);
     current_status.duty = duty_cycle_;
     current_status.duty_max = PWM_MAX;
     current_status.heater_timeout_sec = heater_timeout_sec_;
@@ -380,6 +423,7 @@ void PidCtrl::publish_status() {
     current_status.edge_count_fan2 = fan_state_.fan2_edges;
     current_status.fault_reason = fault_reason_;
     current_status.fault_history = fault_history_;
+    current_status.state = static_cast<ControllerState>(state_);
 
     current_status.panda_work_mode = last_panda_state_.work_mode;
     current_status.panda_work_on = last_panda_state_.work_on;
@@ -396,24 +440,38 @@ Params PidCtrl::get_params() {
         last_panda_state_ = params.panda_state;
         if (params.watchdog_refresh) {
             ws_watchdog_time_ = pid_timenow_;
+        }
+
+        // Process clear fault first
+        if (params.clear_fault) {
+            clear_fault();
+        }
+
+        // If we are in FAULT (and clear_fault didn't get us out of it), ignore temperature command
+        if (state_ == State::FAULT) {
+            ESP_LOGW(TAG, "Ignoring setpoint command %d because device is in FAULT state", params.temp);
             return params;
         }
+
         bool keep_integral = pid_state_.setpoint > 30.0f && std::abs(pid_state_.setpoint - params.temp) <= 3.0;
         if (!keep_integral) {
             pid_state_.integral = 0.0f;
         }
-        ESP_LOGI(TAG, "Command: setpoint %.1f -> %d, timeout %lus, integral=%.1f, integral_kept=%d",
-            pid_state_.setpoint, params.temp, (unsigned long)params.time, pid_state_.integral, (int)keep_integral);
+        if (!params.watchdog_refresh) {
+            ESP_LOGI(TAG, "Command: setpoint %.1f -> %d, timeout %lus, integral=%.1f, integral_kept=%d",
+                pid_state_.setpoint, params.temp, (unsigned long)params.time, pid_state_.integral, (int)keep_integral);
+        }
+        
         pid_state_.setpoint = params.temp;
         heater_timeout_sec_ = params.time;
-        if (params.clear_fault) {
-            clear_fault();
-            stall_check_time_ = 0;
-        }
         fan_speed_ok_ = false;
+
         if (params.temp > 0) {
-            heater_start_time_ = pid_timenow_;
-            ws_watchdog_time_ = pid_timenow_;
+            transition_to(State::HEATING, "setpoint > 0 command");
+        } else {
+            if (state_ == State::HEATING) {
+                transition_to(State::COOLDOWN, "setpoint 0 command");
+            }
         }
     }
     return params;
@@ -461,12 +519,11 @@ void PidCtrl::pid_loop() {
     fan_state_.fan2_sensor = sensor_level_fan2_.load();
 
     temp_ntc_c_ = {};
-    heating_active_ = {};
     heating_time_left_sec_ = {};
     duty_cycle_ = 0;
 
     ScopeGuard set_duty_guard([&]() { // protect against any unexpected scope exits
-        if (has_fault()) {
+        if (state_ == State::FAULT) {
             pid_state_.reset_setpoint();
             duty_cycle_ = 0;
         }
@@ -478,6 +535,7 @@ void PidCtrl::pid_loop() {
 
         temp_ntc_c_ = read_temperature();
 
+        // 1. Over-temperature check
         if (!has_fault(FaultReason::TEMP_OVERTEMP) &&
             (temp_ntc_c_ >= TEMP_OVERTEMP || (temp_filtered_ok && temp_ntc_filtered >= TEMP_OVERTEMP))) {
             ESP_LOGE(TAG, "FAULT: over-temperature cutoff (raw=%.1f°C filtered=%.1f°C limit=%.0f°C)",
@@ -485,44 +543,15 @@ void PidCtrl::pid_loop() {
             set_fault(FaultReason::TEMP_OVERTEMP);
         }
 
-        heating_active_ = !has_fault() && pid_state_.setpoint > 0.0f;
-
-        if (heating_active_) {
-            int64_t elapsed_us = pid_timenow_ - heater_start_time_;
-            if (heater_timeout_sec_ > 0) {
-                int64_t heater_timeout_us = heater_timeout_sec_ * US_PER_SEC;
-                if (elapsed_us >= heater_timeout_us) {
-                    ESP_LOGW(TAG, "Safety timeout (%lus) reached — switching off heater, elapsed_us=%lld timenow %lld heater_start_time %lld",
-                                (unsigned long)heater_timeout_sec_, elapsed_us, pid_timenow_, heater_start_time_);
-                    pid_state_.reset_setpoint();
-                    set_fault(FaultReason::HEAT_TIMEOUT);
-                    heater_timeout_sec_ = 0;
-                }
-                heating_time_left_sec_ = (heater_timeout_us - elapsed_us) / US_PER_SEC;
-            } else if (ws_watchdog_time_ > 0) {
-                int64_t ws_elapsed = pid_timenow_ - ws_watchdog_time_;
-                if (ws_elapsed > WS_WATCHDOG_TIMEOUT_US) {
-                    ESP_LOGW(TAG, "WS watchdog timeout (%.0fs) — switching off heater",
-                             (float)ws_elapsed / US_PER_SEC);
-                    pid_state_.reset_setpoint();
-                    set_fault(FaultReason::HEAT_TIMEOUT);
-                    ws_watchdog_time_ = 0;
-                }
-            } else {
-                ESP_LOGW(TAG, "No safety timeout — switching off heater, elapsed_us=%lld timenow %lld heater_start_time %lld", elapsed_us, pid_timenow_, heater_start_time_);
-                pid_state_.reset_setpoint();
-                set_fault(FaultReason::HEAT_TIMEOUT);
-            }
-        }
-
+        // 2. Sensor reading range check
         if (!check_temp_range(temp_ntc_c_)) {
             if (!has_fault(FaultReason::TEMP_RANGE)) {
                 ESP_LOGE(TAG, "FAULT: temperature reading %.1f°C error or out of range [%.0f–%.0f]", temp_ntc_c_, TEMP_RANGE_MIN, TEMP_RANGE_MAX);
                 set_fault(FaultReason::TEMP_RANGE);
-                pid_state_.reset_setpoint();
                 reset_temp_filter();
             }
         } else {
+            // Temperature filtering
             if (temp_ntc_filtered == 0.0f) {
                 temp_ntc_filtered = temp_ntc_c_;
                 temp_filter_warmup_loops = 0;
@@ -540,58 +569,95 @@ void PidCtrl::pid_loop() {
             }
         }
 
+        // 3. Filtered temperature range check
         if (!check_temp_range(temp_ntc_filtered)) {
             if (temp_filtered_ok && !has_fault(FaultReason::TEMP_FILT_RANGE)) {
                 ESP_LOGE(TAG, "FAULT: filtered temperature %.1f°C error or out of range [%.0f–%.0f]", temp_ntc_filtered, TEMP_RANGE_MIN, TEMP_RANGE_MAX);
-                set_fault(FaultReason::TEMP_RANGE);
-                pid_state_.reset_setpoint();
+                set_fault(FaultReason::TEMP_FILT_RANGE);
                 reset_temp_filter();
             }
         }
 
-        if (has_fault()) {
-            heating_active_ = false;
-            pid_state_.reset_setpoint();
-            heater_timeout_sec_ = 0;
-            duty_cycle_ = {};
-            pid_state_.integral = 0.0f;
-            pid_state_.prev_error = 0.0f;
-            stall_check_time_ = {};
-            stall_baseline_temp_ = {};
-        } else {
-            float dt = PID_INTERVAL_US / US_PER_SEC;
-            duty_cycle_ = static_cast<uint32_t>(compute_pid(temp_ntc_filtered, dt));
+        // --- State Machine Logic ---
+        switch (state_) {
+            case State::IDLE:
+                duty_cycle_ = 0;
+                break;
 
-            if (!has_fault(FaultReason::TEMP_STUCK)) {
-                float error = pid_state_.setpoint - temp_ntc_filtered;
-                if (duty_cycle_ > STALL_MIN_DUTY && error > STALL_ERROR_THRESH) {
-                    if (stall_check_time_ == 0) {
-                        stall_check_time_ = pid_timenow_;
-                        stall_baseline_temp_ = temp_ntc_filtered;
-                    } else {
-                        int64_t elapsed_us = pid_timenow_ - stall_check_time_;
-                        if (elapsed_us >= (int64_t)STALL_TIMEOUT_US) {
-                            if (temp_ntc_filtered < stall_baseline_temp_ + STALL_MIN_RISE) {
-                                ESP_LOGE(TAG, "FAULT: no temperature rise in %ds (%.1f°C -> %.1f°C)", (int)(STALL_TIMEOUT_US / US_PER_SEC), stall_baseline_temp_, temp_ntc_filtered);
-                                set_fault(FaultReason::TEMP_STUCK);
-                            } else {
-                                stall_check_time_ = pid_timenow_;
-                                stall_baseline_temp_ = temp_ntc_filtered;
+            case State::HEATING: {
+                // Compute PID duty cycle
+                float dt = PID_INTERVAL_US / US_PER_SEC;
+                duty_cycle_ = static_cast<uint32_t>(compute_pid(temp_ntc_filtered, dt));
+
+                // Stuck heater check
+                if (!has_fault(FaultReason::TEMP_STUCK)) {
+                    float error = pid_state_.setpoint - temp_ntc_filtered;
+                    if (duty_cycle_ > STALL_MIN_DUTY && error > STALL_ERROR_THRESH) {
+                        if (stall_check_time_ == 0) {
+                            stall_check_time_ = pid_timenow_;
+                            stall_baseline_temp_ = temp_ntc_filtered;
+                        } else {
+                            int64_t elapsed_us = pid_timenow_ - stall_check_time_;
+                            if (elapsed_us >= (int64_t)STALL_TIMEOUT_US) {
+                                if (temp_ntc_filtered < stall_baseline_temp_ + STALL_MIN_RISE) {
+                                    ESP_LOGE(TAG, "FAULT: no temperature rise in %ds (%.1f°C -> %.1f°C)", (int)(STALL_TIMEOUT_US / US_PER_SEC), stall_baseline_temp_, temp_ntc_filtered);
+                                    set_fault(FaultReason::TEMP_STUCK);
+                                } else {
+                                    stall_check_time_ = pid_timenow_;
+                                    stall_baseline_temp_ = temp_ntc_filtered;
+                                }
                             }
                         }
+                    } else {
+                        stall_check_time_ = 0;
+                    }
+                }
+
+                // Safety timeouts check
+                int64_t elapsed_us = pid_timenow_ - heater_start_time_;
+                if (heater_timeout_sec_ > 0) {
+                    int64_t heater_timeout_us = heater_timeout_sec_ * US_PER_SEC;
+                    if (elapsed_us >= heater_timeout_us) {
+                        ESP_LOGW(TAG, "Safety timeout (%lus) reached — switching off heater", (unsigned long)heater_timeout_sec_);
+                        set_fault(FaultReason::HEAT_TIMEOUT);
+                    } else {
+                        heating_time_left_sec_ = (heater_timeout_us - elapsed_us) / US_PER_SEC;
+                    }
+                } else if (ws_watchdog_time_ > 0) {
+                    int64_t ws_elapsed = pid_timenow_ - ws_watchdog_time_;
+                    if (ws_elapsed > WS_WATCHDOG_TIMEOUT_US) {
+                        ESP_LOGW(TAG, "WS watchdog timeout (%.0fs) — switching off heater", (float)ws_elapsed / US_PER_SEC);
+                        set_fault(FaultReason::HEAT_TIMEOUT);
                     }
                 } else {
-                    stall_check_time_ = 0;
+                    ESP_LOGW(TAG, "No safety timeout — switching off heater");
+                    set_fault(FaultReason::HEAT_TIMEOUT);
                 }
+                break;
             }
 
+            case State::COOLDOWN: {
+                duty_cycle_ = 0;
+                int64_t elapsed_us = pid_timenow_ - heater_off_time_;
+                if (elapsed_us >= FAN_COOLDOWN_US) {
+                    transition_to(State::IDLE, "cooldown complete");
+                }
+                break;
+            }
+
+            case State::FAULT:
+                duty_cycle_ = 0;
+                break;
         }
+
         manage_fans();
     }
 
+    heating_active_ = (state_ == State::HEATING);
     publish_status();
 
-    ESP_LOGI(TAG, "fault=%s fault_hist=%s heat=%s DUTY=%lu/%d T=%.1f°C Tf=%.1f°C set=%.1f°C err=%.1f pid_I=%.1f heat_timeout=%lu, heat_time_left=%lu, fans=%s fans_speed=%s, panda=[on=%d mode=%d run=%d], fan_sens: [%d %d]",
+    ESP_LOGI(TAG, "state=%s fault=%s fault_hist=%s heat=%s DUTY=%lu/%d T=%.1f°C Tf=%.1f°C set=%.1f°C err=%.1f pid_I=%.1f heat_timeout=%lu, heat_time_left=%lu, fans=%s fans_speed=%s, panda=[on=%d mode=%d run=%d], fan_sens: [%d %d]",
+                state_to_str(state_),
                 to_string(fault_reason_).c_str(), to_string(fault_history_).c_str(), heating_active_ ? "ON" : "OFF", (unsigned long)duty_cycle_, PWM_MAX,
                 temp_ntc_c_, temp_ntc_filtered, pid_state_.setpoint, pid_state_.setpoint - temp_ntc_c_,
                 pid_state_.integral, heater_timeout_sec_, heating_time_left_sec_,
