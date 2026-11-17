@@ -296,6 +296,21 @@ void WebServer::handle_panda_settings(const char *json_str) {
 
     cJSON_Delete(root);
 
+    {
+        int64_t now = esp_timer_get_time();
+        static int64_t last_ws_rx_time = 0;
+        int64_t delta_ms = last_ws_rx_time ? (now - last_ws_rx_time) / 1000 : 0;
+        last_ws_rx_time = now;
+        ESP_LOGI(TAG, "PANDA_STATE dt=%lldms work_on=%d work_mode=%d set_temp=%d temp=%d "
+                 "filtertemp=%d hotbedtemp=%d isrunning=%d filament_temp=%d filament_timer=%d "
+                 "custom_temp=%d custom_timer=%d should_apply=%d",
+                 delta_ms,
+                 panda_state_.work_on, panda_state_.work_mode, panda_state_.set_temp, panda_state_.temp,
+                 panda_state_.filtertemp, panda_state_.hotbedtemp, (int)panda_state_.isrunning,
+                 panda_state_.filament_temp, panda_state_.filament_timer,
+                 panda_state_.custom_temp, panda_state_.custom_timer, (int)should_apply);
+    }
+
     if (should_apply)
         apply_panda_state();
 }
@@ -452,7 +467,7 @@ esp_err_t WebServer::websocket_handler(httpd_req_t *req) {
         return ret;
 
     rx_buf[ws_pkt.len] = '\0';
-    ESP_LOGI(TAG, "WS RX: %s", rx_buf);
+    ESP_LOGD(TAG, "WS RX: %s", rx_buf);
 
     cJSON *root = cJSON_Parse(rx_buf);
     if (!root) {

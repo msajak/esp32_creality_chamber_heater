@@ -11,6 +11,8 @@
 
 class PidCtrl {
 public:
+    static constexpr size_t STALL_RING_SIZE = 7;
+
     PidCtrl(QueueHandle_t& params_queue, QueueHandle_t& status_queue);
     ~PidCtrl();
 
@@ -104,8 +106,14 @@ private:
     State state_{State::IDLE};
     FaultReason fault_reason_{};
     FaultReason fault_history_{};
-    float stall_baseline_temp_{};
-    int64_t stall_check_time_{};
+    struct StallSample {
+        int64_t time;
+        float temp;
+    };
+    StallSample stall_ring_[STALL_RING_SIZE]{};
+    size_t stall_ring_head_{};
+    size_t stall_ring_count_{};
+    int64_t stall_last_sample_time_{};
 
     int64_t ws_watchdog_time_{};
 

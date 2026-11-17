@@ -29,7 +29,7 @@ static constexpr int PWM_MAX            = (1 << 10) - 1;
 static constexpr int64_t US_PER_SEC            = 1000000;
 static constexpr int64_t PID_INTERVAL_US       = 1 * US_PER_SEC;
 static constexpr int64_t FAN_COOLDOWN_US       = 60 * US_PER_SEC;
-static constexpr int64_t STALL_TIMEOUT_US      = 300 * US_PER_SEC; // 5min
+static constexpr int64_t STALL_TIMEOUT_US      = 600 * US_PER_SEC; // 10min
 static constexpr int64_t FAN_SPINUP_US         = 5 * US_PER_SEC;
 static constexpr int64_t WS_WATCHDOG_TIMEOUT_US = 300 * US_PER_SEC; // 5min
 
@@ -42,6 +42,7 @@ static constexpr float TEMP_OVERTEMP       = 85.0f;
 static constexpr float STALL_MIN_RISE     = 1.0f;
 static constexpr uint32_t STALL_MIN_DUTY  = (uint32_t)(PWM_MAX * 0.5f);
 static constexpr float STALL_ERROR_THRESH = 5.0f;
+static constexpr int64_t STALL_SAMPLE_INTERVAL_US = STALL_TIMEOUT_US / (PidCtrl::STALL_RING_SIZE - 1);
 
 static constexpr const char* TAG = "PID";
 
@@ -249,13 +250,16 @@ void PidCtrl::transition_to(State new_state, const char* reason) {
             duty_cycle_ = 0;
             heater_timeout_sec_ = 0;
             heating_time_left_sec_ = 0;
-            stall_check_time_ = 0;
+            stall_ring_count_ = 0;
+            stall_ring_head_ = 0;
+            stall_last_sample_time_ = 0;
             break;
         case State::HEATING:
             heater_start_time_ = pid_timenow_;
             ws_watchdog_time_ = pid_timenow_;
-            stall_check_time_ = 0;
-            stall_baseline_temp_ = temp_ntc_filtered;
+            stall_ring_count_ = 0;
+            stall_ring_head_ = 0;
+            stall_last_sample_time_ = 0;
             break;
         case State::COOLDOWN:
             pid_state_.reset_setpoint();
@@ -268,7 +272,9 @@ void PidCtrl::transition_to(State new_state, const char* reason) {
             duty_cycle_ = 0;
             heater_timeout_sec_ = 0;
             heating_time_left_sec_ = 0;
-            stall_check_time_ = 0;
+            stall_ring_count_ = 0;
+            stall_ring_head_ = 0;
+            stall_last_sample_time_ = 0;
             pid_state_.integral = 0.0f;
             pid_state_.prev_error = 0.0f;
             break;
@@ -461,7 +467,7 @@ Params PidCtrl::get_params() {
             ESP_LOGI(TAG, "Command: setpoint %.1f -> %d, timeout %lus, integral=%.1f, integral_kept=%d",
                 pid_state_.setpoint, params.temp, (unsigned long)params.time, pid_state_.integral, (int)keep_integral);
         }
-        
+
         pid_state_.setpoint = params.temp;
         heater_timeout_sec_ = params.time;
         fan_speed_ok_ = false;
@@ -589,27 +595,26 @@ void PidCtrl::pid_loop() {
                 float dt = PID_INTERVAL_US / US_PER_SEC;
                 duty_cycle_ = static_cast<uint32_t>(compute_pid(temp_ntc_filtered, dt));
 
-                // Stuck heater check
-                if (!has_fault(FaultReason::TEMP_STUCK)) {
+                // Record temperature samples for stall detection (unconditional while HEATING)
+                if (stall_last_sample_time_ == 0 || (pid_timenow_ - stall_last_sample_time_) >= STALL_SAMPLE_INTERVAL_US) {
+                    stall_ring_[stall_ring_head_] = {pid_timenow_, temp_ntc_filtered};
+                    stall_ring_head_ = (stall_ring_head_ + 1) % STALL_RING_SIZE;
+                    if (stall_ring_count_ < STALL_RING_SIZE) stall_ring_count_++;
+                    stall_last_sample_time_ = pid_timenow_;
+                }
+
+                // Stuck heater check against rolling window
+                if (!has_fault(FaultReason::TEMP_STUCK) && stall_ring_count_ == STALL_RING_SIZE) {
                     float error = pid_state_.setpoint - temp_ntc_filtered;
                     if (duty_cycle_ > STALL_MIN_DUTY && error > STALL_ERROR_THRESH) {
-                        if (stall_check_time_ == 0) {
-                            stall_check_time_ = pid_timenow_;
-                            stall_baseline_temp_ = temp_ntc_filtered;
-                        } else {
-                            int64_t elapsed_us = pid_timenow_ - stall_check_time_;
-                            if (elapsed_us >= (int64_t)STALL_TIMEOUT_US) {
-                                if (temp_ntc_filtered < stall_baseline_temp_ + STALL_MIN_RISE) {
-                                    ESP_LOGE(TAG, "FAULT: no temperature rise in %ds (%.1f°C -> %.1f°C)", (int)(STALL_TIMEOUT_US / US_PER_SEC), stall_baseline_temp_, temp_ntc_filtered);
-                                    set_fault(FaultReason::TEMP_STUCK);
-                                } else {
-                                    stall_check_time_ = pid_timenow_;
-                                    stall_baseline_temp_ = temp_ntc_filtered;
-                                }
-                            }
+                        size_t oldest_idx = stall_ring_head_; // when full, head points to oldest
+                        float oldest_temp = stall_ring_[oldest_idx].temp;
+                        if (temp_ntc_filtered < oldest_temp + STALL_MIN_RISE) {
+                            int64_t span = pid_timenow_ - stall_ring_[oldest_idx].time;
+                            ESP_LOGE(TAG, "FAULT: no temperature rise in %ds (%.1f°C -> %.1f°C)",
+                                     (int)(span / US_PER_SEC), oldest_temp, temp_ntc_filtered);
+                            set_fault(FaultReason::TEMP_STUCK);
                         }
-                    } else {
-                        stall_check_time_ = 0;
                     }
                 }
 
